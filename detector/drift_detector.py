@@ -10,11 +10,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+import smtplib
+from notifier import ConfigError, EmailSettings, load_email_settings, send_email
+from dotenv import load_dotenv
+import io 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("drift-detector")
 
 
@@ -141,6 +144,68 @@ def report(result: DriftResult) -> None:
             name = change.path or "(the whole resource)"
             logger.warning("    %s: expected %r, found %r", name, change.before, change.after)
 
+def build_email(result: DriftResult) -> tuple[str, str]:
+    """Create the email subject and body. Lists names only, never values."""
+    if result.status is DriftStatus.ERROR:
+        subject = "[ERROR] Terraform drift detector failed to run"
+        body = "The drift check could not complete. Check the detector logs for details."
+        return subject, body
+
+    if not result.drifted:
+        subject = "[NOTICE] Terraform plan has pending changes"
+        body = (
+            "Terraform wants to make changes, but nothing was modified outside Terraform.\n"
+            "Likely cause: the .tf code was edited and not yet applied."
+        )
+        return subject, body
+
+    subject = f"[ALERT] Terraform drift detected in {len(result.drifted)} resource(s)"
+    lines = ["Infrastructure no longer matches the Terraform code.", ""]
+    for resource in result.drifted:
+        lines.append(f"Resource: {resource.address}")
+        for change in resource.changes:
+            lines.append(f"  - changed setting: {change.path or '(whole resource)'}")
+    lines += ["", "Values are hidden on purpose. See the detector logs for full details."]
+    return subject, "\n".join(lines)
+
+
+def send_alert(result: DriftResult, log_text: str | None = None) -> bool:
+    """Try to email the result. Returns True if sent. Never crashes the detector."""
+    try:
+        settings: EmailSettings = load_email_settings()
+    except ConfigError as error:
+        logger.error("Email not configured: %s", error)
+        return False
+
+    subject, body = build_email(result)
+    try:
+        send_email(settings, subject, body, attachment=log_text)
+    except smtplib.SMTPAuthenticationError:
+        logger.error("Email login failed. Check SMTP_USERNAME and SMTP_PASSWORD.")
+        return False
+    except (smtplib.SMTPException, OSError) as error:
+        logger.error("Could not send email: %s", error)
+        return False
+    return True
+
+
+def start_log_capture() -> io.StringIO:
+    """Also copy every log line into memory, so we can email it later."""
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger.addHandler(handler)
+    return buffer
+
+
+def last_log_lines(buffer: io.StringIO, max_lines: int = 200) -> str:
+    """Return only the most recent log lines."""
+    lines = buffer.getvalue().splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+
+
 
 def parse_args() -> argparse.Namespace:
     """Read options typed by the user on the command line."""
@@ -151,13 +216,24 @@ def parse_args() -> argparse.Namespace:
         default=Path("infra"),
         help="Folder containing the Terraform code (default: infra)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send an email alert when drift or an error is found",
+    )
 
+    parser.add_argument(
+        "--attach-logs",
+        action="store_true",
+        help="Attach the latest detector logs to the alert email (contains values!)",
+    )
+    return parser.parse_args()
 
 def main() -> int:
     """Entry point. Returns 0 (no drift), 1 (error) or 2 (drift)."""
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     args = parse_args()
-
+    log_buffer = start_log_capture()
     if not args.infra_dir.is_dir():
         logger.error("Folder not found: %s", args.infra_dir)
         return DriftStatus.ERROR.value
@@ -171,6 +247,10 @@ def main() -> int:
         report(result)
     else:
         logger.error("Terraform failed:\n%s", result.output)
+
+    if args.notify and result.status is not DriftStatus.NO_DRIFT:
+        log_text = last_log_lines(log_buffer) if args.attach_logs else None
+        send_alert(result, log_text)
 
     return result.status.value
 
